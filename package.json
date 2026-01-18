@@ -1,0 +1,16 @@
+{
+  "name": "copilot-claude-proxy",
+  "version": "0.1.0",
+  "description": "Anthropic-compatible proxy that forwards Claude Code CLI requests to a GitHub Copilot OpenAI-compatible proxy",
+  "main": "server.js",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@octokit/auth-oauth-device": "^6.1.0",
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2"
+  }
+}
