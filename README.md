@@ -60,9 +60,19 @@ The proxy will automatically refresh the Copilot token (using the saved GitHub O
 If refresh fails, you'll get a **401** and need to redo the device flow.
 
 ## Use with Claude Code CLI
+Claude Code CLI expects Anthropic env vars.
+
+### macOS/Linux
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8082
+export ANTHROPIC_AUTH_TOKEN=test  # any value is fine; this proxy doesn’t validate it
+claude
 ```
-ANTHROPIC_BASE_URL=http://localhost:8082
-ANTHROPIC_AUTH_TOKEN=test
+
+### Windows PowerShell (current session)
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://localhost:8082"
+$env:ANTHROPIC_AUTH_TOKEN = "test"  # any value is fine; this proxy doesn’t validate it
 claude
 ```
 
