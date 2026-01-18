@@ -3,21 +3,30 @@ import fetch from "node-fetch";
 import { createOAuthDeviceAuth } from "@octokit/auth-oauth-device";
 import crypto from "crypto";
 import os from "os";
+import fs from "fs";
+import path from "path";
+import { execSync } from "child_process";
 
 const PORT = Number(process.env.PORT || 8082);
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const COPILOT_OPENAI_BASE_URL = process.env.COPILOT_OPENAI_BASE_URL || null;
-const COPILOT_OPENAI_MODEL = process.env.COPILOT_OPENAI_MODEL || "gpt-4o";
+const COPILOT_DEFAULT_MODEL = process.env.COPILOT_DEFAULT_MODEL || "claude-sonnet-4.5"; // Default model
 const GITHUB_COPILOT_CLIENT_ID = process.env.GITHUB_COPILOT_CLIENT_ID || "Iv1.b507a08c87ecfe98";
+const TOKEN_FILE = path.join(os.homedir(), ".copilot-claude-proxy-tokens.json");
 const GITHUB_COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token";
-const GITHUB_COPILOT_COMPLETIONS_URL = "https://copilot-proxy.githubusercontent.com/v1/engines/copilot-codex/completions";
+const GITHUB_COPILOT_CHAT_URL = "https://api.business.githubcopilot.com/chat/completions";
+const GITHUB_COPILOT_MODELS_URL = "https://api.business.githubcopilot.com/models";
 const RATE_LIMIT_DEFAULT = Number(process.env.RATE_LIMIT_DEFAULT || 60);
 const RATE_LIMIT_CHAT_COMPLETIONS = Number(process.env.RATE_LIMIT_CHAT_COMPLETIONS || 20);
-const MAX_TOKENS_PER_REQUEST = Number(process.env.MAX_TOKENS_PER_REQUEST || 4000);
-const MAX_TOKENS_PER_MINUTE = Number(process.env.MAX_TOKENS_PER_MINUTE || 20000);
+const MAX_TOKENS_PER_REQUEST = Number(process.env.MAX_TOKENS_PER_REQUEST || 128000); // Match Claude Sonnet 4.5 context
+const MAX_TOKENS_PER_MINUTE = Number(process.env.MAX_TOKENS_PER_MINUTE || 200000); // Increased for long conversations
 
 let githubToken = null;
 let copilotToken = null;
+let deviceFlowAuth = null; // Store the auth instance
+let authCheckPromise = null; // Store the ongoing auth check
+let availableModels = null; // Cache available models
+let modelsLastFetched = null; // Last fetch time
 
 const usage = {};
 
@@ -92,52 +101,250 @@ const getMachineId = () => {
   return "copilot-claude-proxy";
 };
 
-const initiateDeviceFlow = async () => {
-  const auth = createOAuthDeviceAuth({
-    clientType: "oauth-app",
-    clientId: GITHUB_COPILOT_CLIENT_ID,
-    scopes: ["read:user"],
-    onVerification(verification) {
-      log("info", "device_flow", {
-        verification_uri: verification.verification_uri,
-        user_code: verification.user_code,
-        expires_in: verification.expires_in,
-        interval: verification.interval
-      });
-    }
-  });
+const saveTokens = () => {
+  try {
+    const data = {
+      githubToken,
+      copilotToken,
+      savedAt: Date.now()
+    };
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(data, null, 2), "utf8");
+    log("debug", "tokens_saved", { file: TOKEN_FILE });
+  } catch (error) {
+    log("error", "token_save_failed", { error: String(error) });
+  }
+};
 
-  const verification = await auth({ type: "oauth" });
-  return {
-    verification_uri: verification.verification_uri,
-    user_code: verification.user_code,
-    expires_in: verification.expires_in,
-    interval: verification.interval,
-    status: "pending_verification"
-  };
+const loadExistingCopilotTokens = () => {
+  // Try GitHub CLI first (best option - uses keyring)
+  try {
+    log("debug", "checking_github_cli");
+    const token = execSync("gh auth token", { encoding: "utf8" }).trim();
+    if (token && (token.startsWith("gho_") || token.startsWith("ghp_"))) {
+      log("info", "found_github_cli_token", { 
+        message: "Using GitHub CLI authentication (from keyring)" 
+      });
+      return token;
+    }
+  } catch (error) {
+    log("debug", "github_cli_not_available", { error: String(error) });
+  }
+
+  // Try Windows Credential Manager via PowerShell
+  if (os.platform() === "win32") {
+    try {
+      log("debug", "checking_windows_credential_manager");
+      
+      const psScript = `
+Add-Type -AssemblyName System.Security
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class CredMan {
+    [DllImport("Advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr);
+    [DllImport("Advapi32.dll", SetLastError = true)]
+    public static extern void CredFree(IntPtr credentialPtr);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct Credential {
+        public int Flags;
+        public int Type;
+        public string TargetName;
+        public string Comment;
+        public long LastWritten;
+        public int CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public int Persist;
+        public int AttributeCount;
+        public IntPtr Attributes;
+        public string TargetAlias;
+        public string UserName;
+    }
+}
+"@
+
+$targets = @("vscode.github-authentication", "cursor.github-authentication", "github.auth")
+foreach ($target in $targets) {
+    try {
+        $credPtr = [IntPtr]::Zero
+        if ([CredMan]::CredRead($target, 1, 0, [ref]$credPtr)) {
+            $cred = [System.Runtime.InteropServices.Marshal]::PtrToStructure($credPtr, [type][CredMan+Credential])
+            $password = [System.Runtime.InteropServices.Marshal]::PtrToStringUni($cred.CredentialBlob, $cred.CredentialBlobSize / 2)
+            [CredMan]::CredFree($credPtr)
+            if ($password -match '^(gho_|ghp_|github_pat_)') {
+                Write-Output $password
+                exit 0
+            }
+        }
+    } catch {}
+}
+`;
+      
+      const token = execSync(`powershell -NoProfile -Command "${psScript}"`, { 
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "ignore"]
+      }).trim();
+      
+      if (token && (token.startsWith("gho_") || token.startsWith("ghp_") || token.startsWith("github_pat_"))) {
+        log("info", "found_token_in_credential_manager", { 
+          message: "Using GitHub token from Windows Credential Manager" 
+        });
+        return token;
+      }
+    } catch (error) {
+      log("debug", "credential_manager_extraction_failed", { error: String(error) });
+    }
+  }
+  
+  // Try environment variable
+  if (process.env.GITHUB_TOKEN) {
+    log("info", "using_env_github_token");
+    return process.env.GITHUB_TOKEN;
+  }
+  
+  // Try to read from VS Code GitHub Copilot extension config files
+  const possiblePaths = [
+    path.join(os.homedir(), "AppData", "Roaming", "GitHub Copilot", "hosts.json"),
+    path.join(os.homedir(), "AppData", "Local", "github-copilot", "hosts.json"),
+    path.join(os.homedir(), ".config", "github-copilot", "hosts.json"),
+    path.join(os.homedir(), "Library", "Application Support", "github-copilot", "hosts.json")
+  ];
+
+  for (const configPath of possiblePaths) {
+    try {
+      if (fs.existsSync(configPath)) {
+        log("debug", "checking_copilot_config", { path: configPath });
+        const content = fs.readFileSync(configPath, "utf8");
+        const config = JSON.parse(content);
+        
+        const githubConfig = config["github.com"];
+        if (githubConfig?.oauth_token) {
+          log("info", "found_existing_copilot_token", { path: configPath });
+          return githubConfig.oauth_token;
+        }
+      }
+    } catch (error) {
+      log("debug", "failed_to_read_config", { path: configPath });
+    }
+  }
+  
+  log("warn", "no_existing_copilot_tokens", { 
+    message: "Could not find existing GitHub Copilot tokens. Will need to authenticate."
+  });
+  return null;
+};
+
+const loadTokens = () => {
+  try {
+    // First, try to load from our saved tokens
+    if (fs.existsSync(TOKEN_FILE)) {
+      const content = fs.readFileSync(TOKEN_FILE, "utf8");
+      const data = JSON.parse(content);
+      if (data.githubToken && data.copilotToken) {
+        githubToken = data.githubToken;
+        copilotToken = data.copilotToken;
+        log("info", "tokens_loaded", { file: TOKEN_FILE });
+        return true;
+      }
+    }
+
+    // If no saved tokens, try to load from existing Copilot installation
+    const existingToken = loadExistingCopilotTokens();
+    if (existingToken) {
+      githubToken = existingToken;
+      log("info", "using_existing_copilot_token");
+      return true;
+    }
+  } catch (error) {
+    log("error", "token_load_failed", { error: String(error) });
+  }
+  return false;
+};
+
+const clearTokens = () => {
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      fs.unlinkSync(TOKEN_FILE);
+      log("info", "tokens_cleared", { file: TOKEN_FILE });
+    }
+  } catch (error) {
+    log("error", "token_clear_failed", { error: String(error) });
+  }
+};
+
+const initiateDeviceFlow = async () => {
+  return new Promise((resolve, reject) => {
+    deviceFlowAuth = createOAuthDeviceAuth({
+      clientType: "oauth-app",
+      clientId: GITHUB_COPILOT_CLIENT_ID,
+      scopes: ["read:user"],
+      onVerification(verification) {
+        log("info", "device_flow_started", {
+          verification_uri: verification.verification_uri,
+          user_code: verification.user_code,
+          expires_in: verification.expires_in
+        });
+        resolve({
+          verification_uri: verification.verification_uri,
+          user_code: verification.user_code,
+          expires_in: verification.expires_in,
+          interval: verification.interval,
+          status: "pending_verification"
+        });
+      }
+    });
+
+    deviceFlowAuth({ type: "oauth" }).catch(reject);
+  });
 };
 
 const checkDeviceFlowAuth = async () => {
   if (githubToken && copilotToken) return true;
 
-  const auth = createOAuthDeviceAuth({
-    clientType: "oauth-app",
-    clientId: GITHUB_COPILOT_CLIENT_ID,
-    scopes: ["read:user"]
-  });
+  if (!deviceFlowAuth) {
+    throw new Error("Device flow not initiated. Call /auth/login first.");
+  }
+// If already checking, return pending
+  if (authCheckPromise) {
+    return false;
+  }
 
   try {
-    const tokenAuth = await auth({ type: "oauth" });
-    if (tokenAuth?.token) {
-      githubToken = tokenAuth.token;
-      await refreshCopilotToken();
-      return true;
-    }
+    // Start the auth check but don't wait for it
+    authCheckPromise = deviceFlowAuth({ type: "oauth" })
+      .then(async (tokenAuth) => {
+        if (tokenAuth?.token) {
+          githubToken = tokenAuth.token;
+          await refreshCopilotToken();
+          saveTokens();
+          deviceFlowAuth = null;
+          authCheckPromise = null;
+          log("info", "authentication_successful");
+          return true;
+        }
+        authCheckPromise = null;
+        return false;
+      })
+      .catch((error) => {
+        authCheckPromise = null;
+        if (String(error?.message || "").includes("authorization_pending") || 
+            String(error?.message || "").includes("slow_down")) {
+          return false;
+        }
+        deviceFlowAuth = null;
+        throw error;
+      });
+
+    // Return immediately - don't wait
     return false;
   } catch (error) {
-    if (String(error?.message || "").includes("authorization_pending")) {
+    authCheckPromise = null;
+    if (String(error?.message || "").includes("authorization_pending") || 
+        String(error?.message || "").includes("slow_down")) {
       return false;
     }
+    deviceFlowAuth = null;
+    deviceFlowAuth = null; // Clear on other errors
     throw error;
   }
 };
@@ -161,6 +368,7 @@ const refreshCopilotToken = async () => {
   }
 
   copilotToken = await response.json();
+  saveTokens();
   return copilotToken;
 };
 
@@ -174,27 +382,38 @@ const ensureCopilotAuth = async () => {
   // If we have a still-valid copilot token, we're good.
   if (isTokenValid()) return;
 
+  // Try to load tokens from disk if not in memory
+  if (!githubToken || !copilotToken) {
+    const loaded = loadTokens();
+    if (loaded && githubToken) {
+      // We have a GitHub token, now get/refresh the Copilot token
+      try {
+        await refreshCopilotToken();
+        if (isTokenValid()) return;
+      } catch (e) {
+        log("warn", "copilot_token_refresh_failed", { error: String(e) });
+      }
+    }
+  }
+
   // If token exists but expired, try refresh (requires githubToken).
-  if (copilotToken?.token && githubToken) {
+  if (githubToken && (!copilotToken || !isTokenValid())) {
     try {
       await refreshCopilotToken();
       if (isTokenValid()) return;
     } catch (e) {
-      // If refresh fails, force re-auth.
-      githubToken = null;
-      copilotToken = null;
-      const err = new Error("Authentication required. Token refresh failed. Call /auth/login then /auth/check.");
-      err.status = 401;
-      err.code = "authentication_failed";
-      throw err;
+      log("error", "token_refresh_failed", { error: String(e) });
+      // Don't clear tokens yet, might be temporary network issue
     }
   }
 
-  // Otherwise, user must run device flow again.
-  const err = new Error("Authentication required. Call /auth/login then /auth/check.");
-  err.status = 401;
-  err.code = "authentication_required";
-  throw err;
+  // If still no valid token, user needs to authenticate
+  if (!isTokenValid()) {
+    const err = new Error("Authentication required. No valid Copilot subscription found. Make sure you have an active GitHub Copilot subscription and run: npm start");
+    err.status = 401;
+    err.code = "authentication_required";
+    throw err;
+  }
 };
 
 const requireAuth = (handler) => {
@@ -327,14 +546,23 @@ const errorHandler = (err, req, res, next) => {
   const status = err.status || 500;
   const message = err.message || "Internal Server Error";
   const code = err.code || "INTERNAL_ERROR";
-  log("error", "handler_error", { status, message, path: req.originalUrl, method: req.method });
-  res.status(status).json({
-    error: {
-      message,
-      code,
-      status
-    }
+  log("error", "handler_error", { 
+    status, 
+    message, 
+    path: req.originalUrl, 
+    method: req.method,
+    stack: err.stack
   });
+  
+  if (!res.headersSent) {
+    res.status(status).json({
+      error: {
+        message,
+        code,
+        status
+      }
+    });
+  }
 };
 
 const rateLimiter = (maxRequestsPerMinute) => {
@@ -475,9 +703,8 @@ const toOpenAIChat = (anthropicRequest) => {
   }
 
   return {
-    model: COPILOT_OPENAI_MODEL,
     messages: openaiMessages,
-    max_tokens: Math.min(max_tokens || 1024, 4096),
+    max_tokens: Math.min(max_tokens || 1024, 16384), // Increased limit for new models
     temperature: typeof temperature === "number" ? temperature : 0.7,
     top_p: typeof top_p === "number" ? top_p : 1,
     stream: Boolean(stream)
@@ -557,24 +784,118 @@ const toAnthropicResponse = (openaiResponse, requestedModel) => {
   };
 };
 
+// Fetch available models from GitHub Copilot
+const fetchAvailableModels = async () => {
+  // Cache for 1 hour
+  if (availableModels && modelsLastFetched && (Date.now() - modelsLastFetched) < 3600000) {
+    return availableModels;
+  }
+
+  try {
+    log("info", "fetching_copilot_models");
+    const response = await fetch(GITHUB_COPILOT_MODELS_URL, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${copilotToken.token}`,
+        "X-GitHub-Api-Version": "2023-07-07",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Plugin-Version": "copilot-chat/0.22.4",
+        "Editor-Version": "vscode/1.95.0",
+        "User-Agent": "GitHubCopilotChat/0.22.4"
+      }
+    });
+
+    if (!response.ok) {
+      log("error", "failed_to_fetch_models", { status: response.status });
+      // Return a default list if API fails
+      return {
+        data: [
+          { id: "gpt-4.1", name: "GPT-4.1", vendor: "Azure OpenAI" },
+          { id: "gpt-4o", name: "GPT-4o", vendor: "Azure OpenAI" },
+          { id: "claude-sonnet-4.5", name: "Claude Sonnet 4.5", vendor: "Anthropic" }
+        ]
+      };
+    }
+
+    const data = await response.json();
+    availableModels = data;
+    modelsLastFetched = Date.now();
+    log("info", "models_fetched", { count: data?.data?.length || 0 });
+    return data;
+  } catch (error) {
+    log("error", "fetch_models_error", { error: error.message });
+    // Return default list on error
+    return {
+      data: [
+        { id: "gpt-4.1", name: "GPT-4.1", vendor: "Azure OpenAI" },
+        { id: "gpt-4o", name: "GPT-4o", vendor: "Azure OpenAI" },
+        { id: "claude-sonnet-4.5", name: "Claude Sonnet 4.5", vendor: "Anthropic" }
+      ]
+    };
+  }
+};
+
+// Map Anthropic model names to GitHub Copilot model names
+const mapModelName = (requestedModel) => {
+  if (!requestedModel) return COPILOT_DEFAULT_MODEL;
+
+  // Direct mappings for common Anthropic model names
+  const modelMappings = {
+    "claude-3-5-sonnet-20241022": "claude-sonnet-4",
+    "claude-3-5-sonnet-20240620": "claude-sonnet-4",
+    "claude-sonnet-3.5": "claude-sonnet-4",
+    "claude-3-sonnet": "claude-sonnet-4",
+    "claude-sonnet-4-5-20251001": "claude-sonnet-4.5",
+    "claude-sonnet-4-5-20250929": "claude-sonnet-4.5",
+    "claude-3-5-haiku-20241022": "claude-sonnet-4.5", // Force Sonnet instead of Haiku
+    "claude-haiku-4-5-20251001": "claude-sonnet-4.5", // Force Sonnet instead of Haiku
+    "claude-opus-4-5-20251101": "claude-sonnet-4.5", // Map opus to sonnet 4.5 (closest available)
+    "gpt-4-turbo": "gpt-4.1",
+    "gpt-4-turbo-preview": "gpt-4.1",
+    "gpt-4-0125-preview": "gpt-4.1"
+  };
+
+  // Check direct mapping first
+  if (modelMappings[requestedModel]) {
+    log("debug", "model_mapped", { from: requestedModel, to: modelMappings[requestedModel] });
+    return modelMappings[requestedModel];
+  }
+
+  // If it looks like a valid GitHub Copilot model ID, use it directly
+  if (requestedModel.startsWith("gpt-") || requestedModel.startsWith("claude-")) {
+    return requestedModel;
+  }
+
+  // Fallback to default
+  log("debug", "model_fallback", { requested: requestedModel, fallback: COPILOT_DEFAULT_MODEL });
+  return COPILOT_DEFAULT_MODEL;
+};
+
 const streamCopilotToAnthropic = async (res, copilotPayload, requestedModel, sessionId) => {
   const controller = new AbortController();
   res.on("close", () => controller.abort());
 
-  const response = await fetch(GITHUB_COPILOT_COMPLETIONS_URL, {
+  // Map the requested model to a GitHub Copilot model
+  const copilotModel = mapModelName(requestedModel);
+  log("info", "using_copilot_model", { requested: requestedModel, actual: copilotModel });
+
+  const response = await fetch(GITHUB_COPILOT_CHAT_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${copilotToken.token}`,
       "X-Request-Id": crypto.randomUUID(),
-      "Machine-Id": getMachineId(),
-      "User-Agent": "GitHubCopilotChat/0.12.0",
-      "Editor-Version": "Claude-CLI/1.0.0",
-      "Editor-Plugin-Version": "copilot-claude-proxy/0.1.0",
-      "Openai-Organization": "github-copilot",
-      "Openai-Intent": "copilot-ghost"
+      "X-GitHub-Api-Version": "2025-10-01",
+      "Copilot-Integration-Id": "vscode-chat",
+      "Editor-Plugin-Version": "copilot-chat/0.36.1",
+      "Editor-Version": "vscode/1.108.1",
+      "Openai-Intent": "conversation-agent",
+      "X-Interaction-Type": "conversation-agent",
+      "X-Interaction-Id": crypto.randomUUID(),
+      "User-Agent": "GitHubCopilotChat/0.36.1"
     },
-    body: JSON.stringify({ ...copilotPayload, stream: true }),
+    body: JSON.stringify({ ...copilotPayload, model: copilotModel, stream: true }),
     signal: controller.signal
   });
 
@@ -588,6 +909,8 @@ const streamCopilotToAnthropic = async (res, copilotPayload, requestedModel, ses
   res.setHeader("Connection", "keep-alive");
 
   const messageId = `msg_${crypto.randomUUID()}`;
+  log("info", "stream_start_anthropic", { messageId, model: requestedModel });
+  
   res.write(`event: message_start\ndata: ${JSON.stringify({
     type: "message_start",
     message: {
@@ -613,72 +936,209 @@ const streamCopilotToAnthropic = async (res, copilotPayload, requestedModel, ses
     content_block: { type: "text", text: "" }
   })}\n\n`);
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const streamId = `msg_${crypto.randomUUID()}`;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  // State tracking for proper content block management (like copilot-api)
+  const streamState = {
+    contentBlockIndex: 0,
+    contentBlockOpen: false,
+    toolCalls: {}  // Map of tool call index -> {id, name, anthropicBlockIndex}
+  };
 
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+  // Handle node-fetch stream (async iterator)
+  let chunkCount = 0;
+  let totalChars = 0;
+  try {
+    for await (const chunk of response.body) {
+      chunkCount++;
+      const text = new TextDecoder().decode(chunk);
+      const lines = text.split("\n");
 
-    for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      const data = line.replace(/^data:\s?/, "").trim();
-      if (!data || data === "[DONE]") continue;
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.replace(/^data:\s?/, "").trim();
+        if (!data || data === "[DONE]") {
+          log("debug", "stream_done_marker", { messageId });
+          continue;
+        }
 
-      let parsed;
-      try {
-        parsed = JSON.parse(data);
-      } catch {
-        continue;
-      }
+        let parsed;
+        try {
+          parsed = JSON.parse(data);
+        } catch (parseErr) {
+          // Silently skip incomplete JSON chunks (common during tool call streaming)
+          continue;
+        }
 
-      const delta = parsed?.choices?.[0]?.text;
-      if (delta) {
-        // very rough estimate: ~4 chars per token
-        if (sessionId) recordTokens(sessionId, Math.ceil(delta.length / 4));
-        res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-          type: "content_block_delta",
-          index: 0,
-          delta: { type: "text_delta", text: delta }
-        })}\n\n`);
+        const choice = parsed?.choices?.[0];
+        if (!choice) continue;
+
+        const delta = choice.delta?.content || choice.text;
+        const toolCalls = choice.delta?.tool_calls;
+
+        // Handle text content
+        if (delta) {
+          // Check if a tool block is currently open
+          const isToolBlockOpen = streamState.contentBlockOpen && 
+            Object.values(streamState.toolCalls).some(tc => tc.anthropicBlockIndex === streamState.contentBlockIndex);
+          
+          if (isToolBlockOpen) {
+            // Close the tool block before starting text
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+              type: "content_block_stop",
+              index: streamState.contentBlockIndex
+            })}\n\n`);
+            streamState.contentBlockIndex++;
+            streamState.contentBlockOpen = false;
+          }
+
+          if (!streamState.contentBlockOpen) {
+            // Start new text block
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({
+              type: "content_block_start",
+              index: streamState.contentBlockIndex,
+              content_block: { type: "text", text: "" }
+            })}\n\n`);
+            streamState.contentBlockOpen = true;
+          }
+
+          totalChars += delta.length;
+          if (sessionId) recordTokens(sessionId, Math.ceil(delta.length / 4));
+          
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+            type: "content_block_delta",
+            index: streamState.contentBlockIndex,
+            delta: { type: "text_delta", text: delta }
+          })}\n\n`);
+        }
+
+        // Handle tool calls (agent mode)
+        if (toolCalls && toolCalls.length > 0) {
+          log("info", "tool_call_received", { 
+            toolCalls: toolCalls,
+            messageId: messageId 
+          });
+          
+          for (const toolCall of toolCalls) {
+            // New tool call starting (has id and name)
+            if (toolCall.id && toolCall.function?.name) {
+              // Close any currently open block first
+              if (streamState.contentBlockOpen) {
+                res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                  type: "content_block_stop",
+                  index: streamState.contentBlockIndex
+                })}\n\n`);
+                streamState.contentBlockIndex++;
+                streamState.contentBlockOpen = false;
+              }
+
+              const anthropicBlockIndex = streamState.contentBlockIndex;
+              streamState.toolCalls[toolCall.index] = {
+                id: toolCall.id,
+                name: toolCall.function.name,
+                anthropicBlockIndex
+              };
+
+              log("info", "tool_call_start", { 
+                toolName: toolCall.function.name, 
+                toolId: toolCall.id,
+                index: anthropicBlockIndex
+              });
+
+              res.write(`event: content_block_start\ndata: ${JSON.stringify({
+                type: "content_block_start",
+                index: anthropicBlockIndex,
+                content_block: {
+                  type: "tool_use",
+                  id: toolCall.id,
+                  name: toolCall.function.name,
+                  input: {}
+                }
+              })}\n\n`);
+              streamState.contentBlockOpen = true;
+            }
+
+            // Tool arguments chunk (may be partial JSON)
+            if (toolCall.function?.arguments) {
+              const toolCallInfo = streamState.toolCalls[toolCall.index];
+              if (toolCallInfo) {
+                res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                  type: "content_block_delta",
+                  index: toolCallInfo.anthropicBlockIndex,
+                  delta: {
+                    type: "input_json_delta",
+                    partial_json: toolCall.function.arguments
+                  }
+                })}\n\n`);
+              }
+            }
+          }
+        }
+
+        // Handle finish_reason
+        if (choice.finish_reason) {
+          if (streamState.contentBlockOpen) {
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+              type: "content_block_stop",
+              index: streamState.contentBlockIndex
+            })}\n\n`);
+            streamState.contentBlockOpen = false;
+          }
+        }
       }
     }
+    log("info", "stream_completed_anthropic", { messageId, chunkCount, totalChars });
+  } catch (streamErr) {
+    log("error", "stream_error_anthropic", { messageId, error: streamErr.message, stack: streamErr.stack });
+    throw streamErr;
   }
 
-  res.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`);
+  // Don't send content_block_stop here - it's already sent when finish_reason is encountered
+  
   res.write(`event: message_delta\ndata: ${JSON.stringify({
     type: "message_delta",
     delta: { stop_reason: "end_turn", stop_sequence: null },
     usage: { output_tokens: 0 }
   })}\n\n`);
+  log("debug", "stream_message_delta", { messageId });
+  
   res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
-  res.write("data: [DONE]\n\n");
+  log("debug", "stream_message_stop", { messageId });
+  
+  // Ensure all data is flushed before ending
+  if (typeof res.flush === 'function') res.flush();
+  
   res.end();
+  log("info", "stream_closed_anthropic", { messageId });
 };
 
 const streamCopilotToOpenAI = async (res, copilotPayload, openaiModel, sessionId) => {
   const controller = new AbortController();
-  res.on("close", () => controller.abort());
+  res.on("close", () => {
+    log("info", "client_closed_connection_openai", { streamId: "pending" });
+    controller.abort();
+  });
 
-  const response = await fetch(GITHUB_COPILOT_COMPLETIONS_URL, {
+  // Map the requested model
+  const copilotModel = mapModelName(openaiModel);
+  log("info", "using_copilot_model_openai", { requested: openaiModel, actual: copilotModel });
+
+  const response = await fetch(GITHUB_COPILOT_CHAT_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${copilotToken.token}`,
       "X-Request-Id": crypto.randomUUID(),
-      "Machine-Id": getMachineId(),
-      "User-Agent": "GitHubCopilotChat/0.12.0",
-      "Editor-Version": "Cursor-IDE/1.0.0",
-      "Editor-Plugin-Version": "copilot-claude-proxy/0.1.0",
-      "Openai-Organization": "github-copilot",
-      "Openai-Intent": "copilot-ghost"
+      "X-GitHub-Api-Version": "2025-10-01",
+      "Copilot-Integration-Id": "vscode-chat",
+      "Editor-Plugin-Version": "copilot-chat/0.36.1",
+      "Editor-Version": "vscode/1.108.1",
+      "Openai-Intent": "conversation-agent",
+      "X-Interaction-Type": "conversation-agent",
+      "X-Interaction-Id": crypto.randomUUID(),
+      "User-Agent": "GitHubCopilotChat/0.36.1"
     },
-    body: JSON.stringify({ ...copilotPayload, stream: true }),
+    body: JSON.stringify({ ...copilotPayload, model: copilotModel, stream: true }),
     signal: controller.signal
   });
 
@@ -692,59 +1152,79 @@ const streamCopilotToOpenAI = async (res, copilotPayload, openaiModel, sessionId
   res.setHeader("Connection", "keep-alive");
 
   const streamId = `chatcmpl-${crypto.randomUUID()}`;
+  log("info", "stream_start_openai", { streamId, model: openaiModel });
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  // Handle node-fetch stream (async iterator)
+  let chunkCount = 0;
+  let totalChars = 0;
+  try {
+    for await (const chunk of response.body) {
+      chunkCount++;
+      const text = new TextDecoder().decode(chunk);
+      const lines = text.split("\n");
+      
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.replace(/^data:\s?/, "").trim();
+        
+        if (data === "[DONE]") {
+          log("debug", "stream_done_marker_openai", { streamId });
+          res.write("data: [DONE]\n\n");
+          continue;
+        }
+        
+        if (!data) continue;
 
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+        let parsed;
+        try {
+          parsed = JSON.parse(data);
+        } catch (parseErr) {
+          log("debug", "stream_parse_error_openai", { line: data.substring(0, 100) });
+          continue;
+        }
 
-    for (const line of lines) {
-      if (!line.startsWith("data:")) continue;
-      const data = line.replace(/^data:\s?/, "").trim();
-      if (!data) continue;
-      if (data === "[DONE]") {
-        res.write("data: [DONE]\n\n");
-        continue;
+        // New chat completions format: choices[0].delta.content
+        const delta = parsed?.choices?.[0]?.delta?.content || parsed?.choices?.[0]?.text;
+        if (!delta) continue;
+        
+        totalChars += delta.length;
+        if (sessionId) recordTokens(sessionId, Math.ceil(delta.length / 4));
+
+        const responseChunk = {
+          id: streamId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: openaiModel,
+          choices: [
+            {
+              index: 0,
+              delta: { content: delta },
+              finish_reason: parsed?.choices?.[0]?.finish_reason || null
+            }
+          ]
+        };
+
+        res.write(`data: ${JSON.stringify(responseChunk)}\n\n`);
       }
-
-      let parsed;
-      try {
-        parsed = JSON.parse(data);
-      } catch {
-        continue;
-      }
-
-      const delta = parsed?.choices?.[0]?.text;
-      if (!delta) continue;
-      if (sessionId) recordTokens(sessionId, Math.ceil(delta.length / 4));
-
-      const chunk = {
-        id: streamId,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: openaiModel,
-        choices: [
-          {
-            index: 0,
-            delta: { content: delta },
-            finish_reason: parsed?.choices?.[0]?.finish_reason || null
-          }
-        ]
-      };
-
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     }
+    log("info", "stream_completed_openai", { streamId, chunkCount, totalChars });
+  } catch (streamErr) {
+    log("error", "stream_error_openai", { streamId, error: streamErr.message, stack: streamErr.stack });
+    throw streamErr;
   }
 
   res.write("data: [DONE]\n\n");
+  log("info", "stream_end_signal_sent_openai", { streamId });
+  
+  // Ensure all data is flushed before ending
+  if (typeof res.flush === 'function') res.flush();
+  
   res.end();
+  log("info", "stream_closed_openai", { streamId });
 };
 
 app.get("/auth/status", async (req, res) => {
@@ -794,7 +1274,14 @@ app.post("/auth/check", async (req, res) => {
 app.post("/auth/logout", (req, res) => {
   githubToken = null;
   copilotToken = null;
+  clearTokens();
   res.json({ status: "logged_out" });
+});
+
+// Stub endpoint for Claude CLI event logging (prevents 404 errors)
+app.post("/api/event_logging/batch", (req, res) => {
+  log("debug", "event_logging_received", { events: req.body?.length || 0 });
+  res.status(200).json({ success: true });
 });
 
 app.post(
@@ -806,41 +1293,130 @@ app.post(
     const requestedModel = anthropicRequest.model || "claude";
     const openaiRequest = toOpenAIChat(anthropicRequest);
 
+    // Check for tools (agent mode)
+    const hasTools = anthropicRequest.tools && anthropicRequest.tools.length > 0;
+    
+    // Check for thinking mode
+    const thinkingBudget = anthropicRequest.thinking_budget || anthropicRequest.thinking?.budget_tokens;
+
+    // Calculate max_tokens: must be > thinking_budget if thinking mode is enabled
+    let maxTokens = openaiRequest.max_tokens || 4096;
+    if (thinkingBudget) {
+      // max_tokens must be greater than thinking_budget
+      // Add at least 4096 tokens for the actual response after thinking
+      maxTokens = Math.max(maxTokens, thinkingBudget + 4096);
+    }
+
+    // Log the converted request for debugging
+    log("info", "request_details", { 
+      model: anthropicRequest.model,
+      messageCount: openaiRequest.messages?.length || 0,
+      agentMode: hasTools,
+      toolCount: anthropicRequest.tools?.length || 0,
+      thinkingMode: !!thinkingBudget,
+      thinkingBudget: thinkingBudget,
+      maxTokens: maxTokens,
+      stream: anthropicRequest.stream
+    });
+
+    // New chat completions format - messages array directly
     const copilotPayload = {
-      prompt: buildCopilotPrompt(openaiRequest.messages),
-      suffix: "",
-      max_tokens: openaiRequest.max_tokens || 500,
+      messages: openaiRequest.messages || [],
+      max_tokens: maxTokens,
       temperature: openaiRequest.temperature || 0.7,
       top_p: openaiRequest.top_p || 1,
       n: 1,
-      stream: Boolean(openaiRequest.stream),
-      stop: ["\n\n"],
-      extra: {
-        language: detectLanguageFromOpenAIMessages(openaiRequest.messages),
-        next_indent: 0,
-        trim_by_indentation: true
-      }
+      stream: true
     };
+
+    // Add tools for agent mode (function calling)
+    // Transform Anthropic tool format to OpenAI/GitHub Copilot format
+    if (hasTools) {
+      copilotPayload.tools = anthropicRequest.tools.map(tool => {
+        // Anthropic format: {name, description, input_schema}
+        // GitHub Copilot expects: {type: "function", function: {name, description, parameters}}
+        const transformed = {
+          type: "function",
+          function: {
+            name: tool.name,
+            description: tool.description || "",
+            parameters: tool.input_schema || {}
+          }
+        };
+        
+        // Log first tool for debugging
+        if (tool.name === "Write") {
+          log("debug", "tool_transformation_example", { 
+            original: tool, 
+            transformed: transformed 
+          });
+        }
+        
+        return transformed;
+      });
+      
+      // Transform tool_choice if present
+      if (anthropicRequest.tool_choice) {
+        if (typeof anthropicRequest.tool_choice === "object" && anthropicRequest.tool_choice.name) {
+          // Anthropic: {type: "tool", name: "tool_name"}
+          // GitHub: {type: "function", function: {name: "tool_name"}}
+          copilotPayload.tool_choice = {
+            type: "function",
+            function: { name: anthropicRequest.tool_choice.name }
+          };
+        } else if (anthropicRequest.tool_choice === "auto" || anthropicRequest.tool_choice === "any") {
+          copilotPayload.tool_choice = "auto";
+        }
+      } else {
+        // If no tool_choice specified but tools are provided, default to "auto"
+        // This tells GitHub Copilot it should actively consider using the tools
+        copilotPayload.tool_choice = "auto";
+      }
+      
+      // Enable parallel tool calls
+      copilotPayload.parallel_tool_calls = true;
+      
+      log("info", "agent_mode_enabled", { 
+        model: requestedModel, 
+        toolCount: anthropicRequest.tools.length,
+        toolNames: anthropicRequest.tools.map(t => t.name).join(", "),
+        tool_choice: copilotPayload.tool_choice
+      });
+    }
+
+    // Add thinking configuration if requested (GitHub Copilot format)
+    if (thinkingBudget) {
+      copilotPayload.thinking = {
+        budget_tokens: thinkingBudget
+      };
+      log("info", "thinking_mode_enabled", { 
+        budget: thinkingBudget,
+        message: "Extended thinking enabled with budget"
+      });
+    }
 
     if (openaiRequest.stream) {
       await streamCopilotToAnthropic(res, copilotPayload, requestedModel, res.locals.sessionId);
       return;
     }
 
-    const response = await fetch(GITHUB_COPILOT_COMPLETIONS_URL, {
+    // Non-streaming: collect the stream and return as single response
+    const copilotModel = mapModelName(requestedModel);
+    log("info", "using_copilot_model_nonstreaming", { requested: requestedModel, actual: copilotModel });
+    
+    const response = await fetch(GITHUB_COPILOT_CHAT_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${copilotToken.token}`,
         "X-Request-Id": crypto.randomUUID(),
-        "Machine-Id": getMachineId(),
-        "User-Agent": "GitHubCopilotChat/0.12.0",
-        "Editor-Version": "Claude-CLI/1.0.0",
-        "Editor-Plugin-Version": "copilot-claude-proxy/0.1.0",
-        "Openai-Organization": "github-copilot",
-        "Openai-Intent": "copilot-ghost"
+        "X-GitHub-Api-Version": "2023-07-07",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Plugin-Version": "copilot-chat/0.22.4",
+        "Editor-Version": "vscode/1.95.0",
+        "User-Agent": "GitHubCopilotChat/0.22.4"
       },
-      body: JSON.stringify(copilotPayload)
+      body: JSON.stringify({ ...copilotPayload, model: copilotModel, stream: true })
     });
 
     if (!response.ok) {
@@ -848,29 +1424,73 @@ app.post(
       throw new Error(`Copilot error ${response.status}: ${text}`);
     }
 
-    const data = await response.json();
+    // Collect streaming response
+    let fullText = "";
+    
+    if (!response.body) {
+      throw new Error("No response body from Copilot");
+    }
+
+    // Handle node-fetch stream (Node.js stream, not web stream)
+    for await (const chunk of response.body) {
+      const text = new TextDecoder().decode(chunk);
+      const lines = text.split("\n");
+      
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.replace(/^data:\s?/, "").trim();
+        if (!data || data === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          // New format: delta.content or old format: text
+          const delta = parsed?.choices?.[0]?.delta?.content || parsed?.choices?.[0]?.text;
+          if (delta) {
+            fullText += delta;
+          }
+        } catch (e) {
+          // Skip invalid JSON
+        }
+      }
+    }
+
     const openaiResponse = {
       id: `chatcmpl-${crypto.randomUUID()}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
-      model: COPILOT_OPENAI_MODEL,
-      choices: data.choices.map((choice, index) => ({
-        index,
+      model: copilotModel,
+      choices: [{
+        index: 0,
         message: {
           role: "assistant",
-          content: choice.text
+          content: fullText
         },
-        finish_reason: choice.finish_reason || "stop"
-      })),
-      usage: data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+        finish_reason: "stop"
+      }],
+      usage: { 
+        prompt_tokens: Math.ceil(JSON.stringify(copilotPayload.messages).length / 4), 
+        completion_tokens: Math.ceil(fullText.length / 4), 
+        total_tokens: Math.ceil((JSON.stringify(copilotPayload.messages).length + fullText.length) / 4) 
+      }
     };
 
     const anthropicResponse = toAnthropicResponse(openaiResponse, requestedModel);
-    recordTokens(res.locals.sessionId, openaiResponse?.usage?.total_tokens || 0);
+    recordTokens(res.locals.sessionId, openaiResponse.usage.total_tokens || 0);
     res.json(anthropicResponse);
   } catch (error) {
-    log("error", "request_failed", { error: String(error) });
-    res.status(error.status || 500).json({ error: String(error) });
+    log("error", "request_failed", { 
+      error: String(error),
+      stack: error.stack,
+      path: "/v1/messages"
+    });
+    if (!res.headersSent) {
+      res.status(error.status || 500).json({ 
+        error: {
+          message: String(error),
+          type: "request_failed"
+        }
+      });
+    }
   }
   })
 );
@@ -902,15 +1522,29 @@ app.get("/", (req, res) => {
 app.get(
   "/v1/models",
   rateLimiter(),
-  requireAuth((req, res) => {
-    res.json({
-      object: "list",
-      data: [
-        { id: "gpt-4", object: "model", created: Date.now(), owned_by: "github-copilot" },
-        { id: "gpt-4o", object: "model", created: Date.now(), owned_by: "github-copilot" },
-        { id: "gpt-3.5-turbo", object: "model", created: Date.now(), owned_by: "github-copilot" }
-      ]
-    });
+  requireAuth(async (req, res) => {
+    try {
+      const models = await fetchAvailableModels();
+      
+      // Convert to OpenAI format for compatibility
+      const openaiModels = (models?.data || []).map(model => ({
+        id: model.id,
+        object: "model",
+        created: Date.now(),
+        owned_by: model.vendor || "github-copilot",
+        permission: [],
+        root: model.id,
+        parent: null
+      }));
+
+      res.json({
+        object: "list",
+        data: openaiModels
+      });
+    } catch (error) {
+      log("error", "models_endpoint_error", { error: error.message });
+      res.status(500).json({ error: "Failed to fetch models" });
+    }
   })
 );
 
@@ -920,41 +1554,62 @@ app.post(
   requireAuth(async (req, res) => {
   const openaiRequest = req.body || {};
   try {
+    // Check for tools (agent mode)
+    const hasTools = openaiRequest.tools && openaiRequest.tools.length > 0;
+    
+    if (hasTools) {
+      log("info", "agent_mode_enabled", { 
+        toolCount: openaiRequest.tools.length,
+        toolNames: openaiRequest.tools.map(t => t.function?.name || t.name).join(", ")
+      });
+    }
+
+    // New chat completions format - messages array directly
     const copilotPayload = {
-      prompt: buildCopilotPrompt(openaiRequest.messages || []),
-      suffix: "",
-      max_tokens: openaiRequest.max_tokens || 500,
+      messages: openaiRequest.messages || [],
+      max_tokens: openaiRequest.max_tokens || 4096,
       temperature: openaiRequest.temperature || 0.7,
       top_p: openaiRequest.top_p || 1,
       n: openaiRequest.n || 1,
-      stream: Boolean(openaiRequest.stream),
-      stop: ["\n\n"],
-      extra: {
-        language: detectLanguageFromOpenAIMessages(openaiRequest.messages || []),
-        next_indent: 0,
-        trim_by_indentation: true
-      }
+      stream: Boolean(openaiRequest.stream)
     };
 
+    // Add tools for agent mode (function calling)
+    if (hasTools) {
+      copilotPayload.tools = openaiRequest.tools;
+      if (openaiRequest.tool_choice) {
+        copilotPayload.tool_choice = openaiRequest.tool_choice;
+      }
+    }
+
+    log("debug", "chat_completions_request", {
+      model: openaiRequest.model,
+      messageCount: copilotPayload.messages.length,
+      stream: copilotPayload.stream,
+      hasTools: hasTools
+    });
+
     if (openaiRequest.stream) {
-      await streamCopilotToOpenAI(res, copilotPayload, openaiRequest.model || COPILOT_OPENAI_MODEL, res.locals.sessionId);
+      await streamCopilotToOpenAI(res, copilotPayload, openaiRequest.model || COPILOT_DEFAULT_MODEL, res.locals.sessionId);
       return;
     }
 
-    const response = await fetch(GITHUB_COPILOT_COMPLETIONS_URL, {
+    const copilotModel = mapModelName(openaiRequest.model || COPILOT_DEFAULT_MODEL);
+    log("info", "using_copilot_model_openai_nonstreaming", { requested: openaiRequest.model, actual: copilotModel });
+
+    const response = await fetch(GITHUB_COPILOT_CHAT_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${copilotToken.token}`,
         "X-Request-Id": crypto.randomUUID(),
-        "Machine-Id": getMachineId(),
-        "User-Agent": "GitHubCopilotChat/0.12.0",
-        "Editor-Version": "Cursor-IDE/1.0.0",
-        "Editor-Plugin-Version": "copilot-claude-proxy/0.1.0",
-        "Openai-Organization": "github-copilot",
-        "Openai-Intent": "copilot-ghost"
+        "X-GitHub-Api-Version": "2023-07-07",
+        "Copilot-Integration-Id": "vscode-chat",
+        "Editor-Plugin-Version": "copilot-chat/0.22.4",
+        "Editor-Version": "vscode/1.95.0",
+        "User-Agent": "GitHubCopilotChat/0.22.4"
       },
-      body: JSON.stringify(copilotPayload)
+      body: JSON.stringify({ ...copilotPayload, model: copilotModel, stream: true })
     });
 
     if (!response.ok) {
@@ -962,27 +1617,71 @@ app.post(
       throw new Error(`Copilot error ${response.status}: ${text}`);
     }
 
-    const data = await response.json();
+    // Collect streaming response
+    let fullText = "";
+    
+    if (!response.body) {
+      throw new Error("No response body from Copilot");
+    }
+
+    // Handle node-fetch stream (Node.js stream, not web stream)
+    for await (const chunk of response.body) {
+      const text = new TextDecoder().decode(chunk);
+      const lines = text.split("\n");
+      
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.replace(/^data:\s?/, "").trim();
+        if (!data || data === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          // New format: delta.content or old format: text
+          const delta = parsed?.choices?.[0]?.delta?.content || parsed?.choices?.[0]?.text;
+          if (delta) {
+            fullText += delta;
+          }
+        } catch (e) {
+          // Skip invalid JSON
+        }
+      }
+    }
+
     const responsePayload = {
       id: `chatcmpl-${crypto.randomUUID()}`,
       object: "chat.completion",
       created: Math.floor(Date.now() / 1000),
-      model: openaiRequest.model || "copilot",
-      choices: data.choices.map((choice, index) => ({
-        index,
+      model: copilotModel,
+      choices: [{
+        index: 0,
         message: {
           role: "assistant",
-          content: choice.text
+          content: fullText
         },
-        finish_reason: choice.finish_reason || "stop"
-      })),
-      usage: data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+        finish_reason: "stop"
+      }],
+      usage: { 
+        prompt_tokens: Math.ceil(JSON.stringify(copilotPayload.messages).length / 4), 
+        completion_tokens: Math.ceil(fullText.length / 4), 
+        total_tokens: Math.ceil((JSON.stringify(copilotPayload.messages).length + fullText.length) / 4) 
+      }
     };
     recordTokens(res.locals.sessionId, responsePayload.usage.total_tokens || 0);
     res.json(responsePayload);
   } catch (error) {
-    log("error", "copilot_completion_failed", { error: String(error) });
-    res.status(500).json({ error: String(error) });
+    log("error", "copilot_completion_failed", { 
+      error: String(error),
+      stack: error.stack,
+      path: "/v1/chat/completions"
+    });
+    if (!res.headersSent) {
+      res.status(500).json({ 
+        error: {
+          message: String(error),
+          type: "completion_failed"
+        }
+      });
+    }
   }
   })
 );
@@ -1039,6 +1738,53 @@ app.post(
 
 app.use(errorHandler);
 
-app.listen(PORT, () => {
-  log("info", "server_started", { port: PORT, copilotBase: COPILOT_OPENAI_BASE_URL });
-});
+// Load tokens on startup
+(async () => {
+  log("info", "server_starting", { port: PORT });
+  
+  // Try to load existing tokens from our saved file
+  let loaded = loadTokens();
+  
+  // If no saved tokens, try to find existing Copilot installation
+  if (!loaded || !githubToken) {
+    log("info", "checking_for_existing_copilot_auth");
+    const existingToken = loadExistingCopilotTokens();
+    if (existingToken) {
+      githubToken = existingToken;
+      loaded = true;
+    }
+  }
+  
+  // If we have a GitHub token, get the Copilot token
+  if (loaded && githubToken) {
+    try {
+      log("info", "refreshing_copilot_token");
+      await refreshCopilotToken();
+      log("info", "server_ready", { 
+        port: PORT, 
+        authenticated: true,
+        message: "✓ Authenticated with GitHub Copilot - Ready to use!"
+      });
+    } catch (error) {
+      log("error", "token_refresh_failed", { 
+        error: String(error),
+        message: "GitHub token found but Copilot access failed. You may need an active Copilot subscription."
+      });
+      log("info", "manual_auth_required", {
+        message: "Run: Invoke-RestMethod -Uri http://localhost:8082/auth/login -Method Post"
+      });
+    }
+  } else {
+    log("warn", "no_authentication_found", {
+      message: "No GitHub Copilot authentication found. Please authenticate:"
+    });
+    log("info", "auth_instructions", {
+      step1: "Invoke-RestMethod -Uri http://localhost:8082/auth/login -Method Post",
+      step2: "Go to the URL and enter the code shown",
+      step3: "Invoke-RestMethod -Uri http://localhost:8082/auth/check -Method Post"
+    });
+  }
+  
+  app.listen(PORT);
+})();
+
